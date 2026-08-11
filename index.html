@@ -9,7 +9,7 @@
 <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 <style>
-/* ----- все стили без изменений (см. исходный файл) ----- */
+/* ----- все стили без изменений, кроме добавленного overflow:hidden для .chart-wrap ----- */
 :root{
   --bg:#000000;
   --surface:#0F1112;
@@ -121,8 +121,18 @@ input[type=date]{color-scheme:dark}
 }
 .card h3{font-size:14px;margin-bottom:2px}
 .card .hint{font-size:11.5px;color:var(--sec);margin-top:3px}
-.chart-wrap{position:relative;height:240px;margin-top:12px}
+.chart-wrap{
+  position:relative;
+  height:240px;
+  margin-top:12px;
+  overflow:hidden;   /* ← добавлено, чтобы график не вылезал */
+}
 .chart-wrap.tall{height:280px}
+.chart-wrap canvas{
+  width:100%;
+  height:100%;
+  display:block;
+}
 .grid2{display:grid;grid-template-columns:1fr;gap:0}
 
 .tscroll{overflow-x:auto;margin-top:12px;-webkit-overflow-scrolling:touch}
@@ -653,7 +663,7 @@ function applyFilters(){
 }
 
 /* ═══════════════════════════════════════════════════════
-   5. ГРАФИКИ — ИСПРАВЛЕННАЯ ВЕРСИЯ
+   5. ГРАФИКИ — ЛЕНИВАЯ ИНИЦИАЛИЗАЦИЯ
    ═══════════════════════════════════════════════════════ */
 const C = {
   accent: '#A80719', accentLt: '#E11B33', sec: '#6B757B',
@@ -662,73 +672,115 @@ const C = {
 };
 const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-// Глобальный реестр графиков
 const charts = {};
+const pendingCharts = {}; // key → {canvasId, buildFn, data, options}
 
-// Функция для безопасного создания/обновления графика
-function renderChart(key, canvasId, buildChartFn) {
-  // Если график уже существует — просто обновляем данные
+function isElementVisible(el) {
+  if (!el) return false;
+  const rect = el.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+
+function createChartInstance(key, canvasId, buildFn) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) {
+    console.warn('Canvas не найден:', canvasId);
+    return false;
+  }
+  // Проверяем, что canvas видим (или его родительская панель активна)
+  const panel = canvas.closest('.panel');
+  if (panel && !panel.classList.contains('active')) {
+    // Откладываем создание
+    pendingCharts[key] = {canvasId, buildFn};
+    return false;
+  }
+  // Если график уже существует, обновляем
   if (charts[key]) {
     try {
-      const result = buildChartFn();
+      const result = buildFn();
       charts[key].data = result.data;
       charts[key].options = result.options || charts[key].options;
       charts[key].update(reduced ? 'none' : undefined);
       charts[key].resize();
-      return;
+      return true;
     } catch (e) {
       console.warn('Ошибка при обновлении графика ' + key, e);
-      // Если обновление не удалось — удаляем старый график и создаём заново
       try { charts[key].destroy(); } catch(_) {}
       delete charts[key];
     }
   }
-
-  // Создаём новый график
+  // Создаём новый
   try {
-    const canvas = document.getElementById(canvasId);
-    if (!canvas) {
-      console.warn('Canvas не найден:', canvasId);
-      return;
-    }
-
-    // Принудительно задаём размеры canvas
-    const parent = canvas.parentElement;
-    if (parent) {
-      const rect = parent.getBoundingClientRect();
-      if (rect.width > 0 && rect.height > 0) {
-        canvas.width = rect.width;
-        canvas.height = rect.height;
+    // Принудительно задаём размеры canvas через CSS (уже заданы)
+    // но если canvas имеет нулевые размеры, задаём временные
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) {
+      // Если родительский контейнер скрыт, зададим фиктивные размеры
+      const parent = canvas.parentElement;
+      const pRect = parent ? parent.getBoundingClientRect() : null;
+      if (pRect && pRect.width > 0 && pRect.height > 0) {
+        canvas.style.width = pRect.width + 'px';
+        canvas.style.height = pRect.height + 'px';
       } else {
-        // Если родитель скрыт — задаём размеры по умолчанию
-        canvas.width = 400;
-        canvas.height = 240;
+        canvas.style.width = '400px';
+        canvas.style.height = '240px';
       }
     }
-
     const ctx = canvas.getContext('2d');
     if (!ctx) throw new Error('Нет контекста 2d');
-
-    const result = buildChartFn();
+    const result = buildFn();
     const config = {
       type: result.type || 'bar',
       data: result.data,
       options: result.options || {}
     };
-
     charts[key] = new Chart(ctx, config);
-
-    // Принудительная перерисовка после создания
+    // Подгоняем размер
     setTimeout(() => {
       if (charts[key]) {
         charts[key].resize();
         charts[key].update(reduced ? 'none' : undefined);
       }
     }, 100);
-
+    return true;
   } catch (e) {
     console.error('Ошибка при создании графика ' + key, e);
+    // Если не удалось, откладываем
+    pendingCharts[key] = {canvasId, buildFn};
+    return false;
   }
+}
+
+function processPendingCharts() {
+  const keys = Object.keys(pendingCharts);
+  let created = false;
+  for (const key of keys) {
+    const {canvasId, buildFn} = pendingCharts[key];
+    const canvas = document.getElementById(canvasId);
+    if (canvas) {
+      const panel = canvas.closest('.panel');
+      if (!panel || panel.classList.contains('active')) {
+        if (createChartInstance(key, canvasId, buildFn)) {
+          delete pendingCharts[key];
+          created = true;
+        }
+      }
+    } else {
+      // canvas не существует — удаляем из pending
+      delete pendingCharts[key];
+    }
+  }
+  if (created) {
+    // Дополнительно подгоняем размеры всех графиков
+    Object.values(charts).forEach(ch => { try { ch.resize(); } catch(e) {} });
+  }
+}
+
+// Основная функция для вызова из кода
+function renderChart(key, canvasId, buildFn) {
+  // Пытаемся создать сейчас, если не получится — отложится
+  createChartInstance(key, canvasId, buildFn);
+  // Если создание не удалось и график не появился в charts, то он уже в pending
 }
 
 /* ── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ГРАФИКОВ ── */
@@ -1168,12 +1220,12 @@ function rebuild(){
     cascade();
     firstRender = false;
   }
-  // Принудительная перерисовка всех графиков после загрузки
+  // Обрабатываем отложенные графики
   setTimeout(() => {
-    Object.values(charts).forEach(ch => {
-      try { ch.resize(); ch.update(); } catch(e) {}
-    });
-  }, 500);
+    processPendingCharts();
+    // дополнительно подгоняем размеры всех существующих
+    Object.values(charts).forEach(ch => { try { ch.resize(); } catch(e) {} });
+  }, 300);
 }
 
 function redraw(){
@@ -1194,11 +1246,10 @@ function cascade(){
 document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
   document.querySelectorAll('.tab').forEach(x => x.setAttribute('aria-selected', String(x === t)));
   document.querySelectorAll('.panel').forEach(p => p.classList.toggle('active', p.id === t.dataset.tab));
-  // При переключении вкладки перерисовываем все графики
+  // После переключения вкладки обрабатываем отложенные графики
   setTimeout(() => {
-    Object.values(charts).forEach(ch => {
-      try { ch.resize(); ch.update(); } catch(e) {}
-    });
+    processPendingCharts();
+    Object.values(charts).forEach(ch => { try { ch.resize(); } catch(e) {} });
   }, 200);
 }));
 
